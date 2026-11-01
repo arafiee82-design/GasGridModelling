@@ -1,120 +1,105 @@
-clear; clc; close all;
+%% Steady-state hydrogen flow in a gas grid
+% Network: 200 km main pipe (4 x 50 km) + 4 connections (20 km) to 4 GTs
+clear; clc;
 
-%% 1. Problem definition
+%% ---------- Gas and environment properties ----------
+p.M    = 2.016e-3;     % Molar mass of H2 [kg/mol]
+p.R    = 8.314;        % Universal gas constant [J/(mol K)]
+p.T    = 288.15;       % Gas temperature [K] (assumed)
+p.Z    = 1.0;          % Compressibility factor (ideal gas assumption)
+p.mu   = 9.0e-6;       % Dynamic viscosity of H2 [Pa s]
+p.eps  = 0.045e-3;     % Pipe roughness (steel) [m]
+LHV    = 120e6;        % Lower heating value of H2 [J/kg]
 
-t0 = 0;
-tf = 1;
-y0 = 1;
-N = 10;  % Number of interior Legendre points
+%% ---------- Network geometry and operating limits ----------
+p.P_in = 70e5;         % Inlet pressure [Pa] (70 bar)
+p.P_min = 20e5;        % Minimum allowable GT inlet pressure [Pa] (assumed)
+p.L1   = 50e3;         % Main segment length [m]
+p.L2   = 20e3;         % Connection length [m]
+p.v_max = 40;          % Maximum allowed gas velocity [m/s]
+nGT    = 4;
 
-% Reference solution
-yExact = @(t) 1 ./ (1 + 2*t);
+%% ---------- Single case: given diameters ----------
+GT_MW = 50;                          % GT size [MW]
+D1    = 0.600;                       % Main pipe diameter [m]
+D2    = 0.150;                       % Connection diameter [m]
 
-%% 2. Solve the ODE using ode23
-tPlot = linspace(t0, tf, 201);
+mGT   = (GT_MW*1e6/LHV) * ones(1,nGT);   % Mass flow per GT [kg/s]
+out   = simulateGrid(mGT, D1, D2, p);
 
-optsODE = odeset('RelTol', 1e-10, 'AbsTol', 1e-12);
+fprintf('--- Single case: GT = %d MW, D1 = %d mm, D2 = %d mm ---\n', GT_MW, D1*1e3, D2*1e3);
+fprintf('Main segment pressures [bar]: '); fprintf('%.3f  ', out.P_main/1e5); fprintf('\n');
+fprintf('GT inlet pressures    [bar]: '); fprintf('%.3f  ', out.P_GT/1e5);   fprintf('\n');
+fprintf('Max velocity          [m/s]: %.2f\n\n', out.Vmax);
 
-[tODE, yODE] = ode23( ...
-    @(t,y) -2*y.^2, tPlot, y0, optsODE);
+%% ---------- Sweep: smallest diameters that satisfy constraints ----------
+GT_list = 50:50:500;
+D1_list = [600 750 900]*1e-3;
+D2_list = [150 200 250 300 400 450 500 600 650 750 900]*1e-3;
 
-%% 3. Build Legendre-based collocation nodes
-z = legendreRoots(N);
-gaussNodes = sort((z + 1)/2);
-
-% Include the initial and final endpoints
-x = [0; gaussNodes; 1];
-M = numel(x);
-
-%% 4. Construct the differentiation matrix
-% Barycentric weights
-w = ones(M,1);
-
-for i = 1:M
-    for j = 1:M
-        if i ~= j
-            w(i) = w(i) / (x(i) - x(j));
+fprintf('%-8s %-10s %-10s %-12s %-12s\n', 'GT[MW]', 'D1[mm]', 'D2[mm]', 'Vmax[m/s]', 'P_GT,min[bar]');
+for g = GT_list
+    mGT = (g*1e6/LHV) * ones(1,nGT);
+    found = false;
+    for d1 = D1_list
+        for d2 = D2_list
+            o = simulateGrid(mGT, d1, d2, p);
+            if o.Vmax <= p.v_max && min(o.P_GT) >= p.P_min
+                fprintf('%-8d %-10d %-10d %-12.2f %-12.2f\n', g, d1*1e3, d2*1e3, o.Vmax, min(o.P_GT)/1e5);
+                found = true;
+                break;
+            end
         end
+        if found, break; end
+    end
+    if ~found
+        fprintf('%-8d  no feasible combination in the given diameter list\n', g);
     end
 end
 
-D = zeros(M,M);
+%% ========================================================================
+function out = simulateGrid(mGT, D1, D2, p)
+% mGT : 1 x nGT vector of GT mass flows [kg/s]
+% D1  : main pipe diameter [m]
+% D2  : connection diameter [m]
+nGT = numel(mGT);
 
-for i = 1:M
-    for j = 1:M
-        if i ~= j
-            D(i,j) = w(j) / (w(i)*(x(i)-x(j)));
-        end
-    end
+% Main segment k (from node k-1 to node k) carries demand of GT k..nGT
+mainFlow = fliplr(cumsum(fliplr(mGT)));
 
-    D(i,i) = -sum(D(i,[1:i-1, i+1:M]));
+P_main = zeros(1, nGT+1);
+P_main(1) = p.P_in;
+P_GT = zeros(1, nGT);
+Vmax = 0;
+
+for k = 1:nGT
+    % Main transmission segment k (50 km)
+    [P_main(k+1), vM] = segmentOutlet(P_main(k), mainFlow(k), D1, p.L1, p);
+
+    % Connection from node k to GT k (20 km)
+    [P_GT(k), vC] = segmentOutlet(P_main(k+1), mGT(k), D2, p.L2, p);
+
+    Vmax = max([Vmax, vM, vC]);
 end
 
-%% 5. Solve the nonlinear algebraic system with fsolve
-% The initial condition y(0) = 1 is already known.
-% Unknowns are y at all remaining collocation nodes.
-residual = @(zUnknown) ...
-    D(2:end,:) * [y0; zUnknown] ...
-    + 2 * zUnknown.^2;
+out.P_main = P_main;
+out.P_GT   = P_GT;
+out.Vmax   = Vmax;
+end
 
-z0 = yExact(x(2:end));
+%% ========================================================================
+function [Pout, vout] = segmentOutlet(Pin, mdot, D, L, p)
+% Isothermal pressure drop for a single pipe segment (steady state)
+%   Pin^2 - Pout^2 = 16 f mdot^2 Z R T L / (pi^2 D^5 M)
 
-optsFS = optimoptions('fsolve', ...
-    'Display','off', ...
-    'FunctionTolerance',1e-12, ...
-    'StepTolerance',1e-12);
+A  = pi*D^2/4;                       % Cross-section area [m^2]
+Re = 4*mdot/(pi*D*p.mu);             % Reynolds number (independent of pressure)
 
-[zSol, fval, exitflag] = fsolve( ...
-    residual, z0, optsFS);
+% Swamee-Jain explicit friction factor (approximates Colebrook)
+f  = 0.25 / (log10(p.eps/(3.7*D) + 5.74/Re^0.9))^2;
 
-yNodes = [y0; zSol];
+Pout = sqrt(Pin^2 - 16*f*mdot^2*p.Z*p.R*p.T*L/(pi^2*D^5*p.M));
 
-%% 6. Evaluate the collocation polynomial
-yColl = barycentricEval(x, yNodes, w, tPlot);
-
-yRef = yExact(tPlot);
-
-%% 7. Compare errors
-% Evaluate both methods on the same time grid
-yODEcommon = interp1(tODE, yODE, tPlot, 'pchip');
-yExactCommon = yExact(tPlot);
-
-errODE = abs(yODEcommon - yExactCommon);
-errColl = abs(yColl - yExactCommon);
-
-figure;
-
-semilogy(tPlot, max(errODE, eps), ...
-    'b-', 'LineWidth', 1.5);
-hold on;
-
-semilogy(tPlot, max(errColl, eps), ...
-    'r--', 'LineWidth', 1.5);
-
-xlabel('t');
-ylabel('Absolute error');
-title('Numerical Error Comparison');
-legend('ode23', 'Collocation', 'Location', 'best');
-grid on;
-
-%% 8. Plot solutions
-figure;
-
-plot(tPlot, yRef, 'k-', 'LineWidth', 2);
-hold on;
-plot(tODE, yODE, 'b--', 'LineWidth', 1.5);
-plot(tPlot, yColl, 'r:', 'LineWidth', 2);
-plot(x, yNodes, 'ro', 'MarkerFaceColor','r');
-
-xlabel('t');
-ylabel('y(t)');
-title('Orthogonal Collocation vs ode23');
-legend('Exact solution', 'ode23', ...
-    'Collocation polynomial', 'Collocation nodes', ...
-    'Location','best');
-grid on;
-
-fprintf('ode23 error = %.3e\n', max(errODE));
-fprintf('Collocation error = %.3e\n', max(errColl));
-fprintf('Nonlinear residual = %.3e\n', norm(fval, inf));
-fprintf('fsolve exitflag = %d\n', exitflag);
+% Velocity at outlet (lowest pressure, highest velocity in the segment)
+vout = mdot*p.Z*p.R*p.T/(Pout*p.M*A);
+end
